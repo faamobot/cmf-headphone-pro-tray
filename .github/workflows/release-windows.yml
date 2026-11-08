@@ -1,0 +1,54 @@
+name: Build Windows release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish self-contained Windows x64 app
+        shell: pwsh
+        run: >-
+          dotnet publish CmfTray.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          --output release
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+
+      - name: Package portable download
+        shell: pwsh
+        run: |
+          $packageDir = Join-Path $env:RUNNER_TEMP "CmfTray-win-x64"
+          New-Item -ItemType Directory -Path $packageDir | Out-Null
+          Copy-Item release/CmfTray.exe $packageDir
+          Copy-Item README.md $packageDir
+          Compress-Archive -Path "$packageDir/*" -DestinationPath release/CmfTray-win-x64.zip
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: >-
+          gh release create $env:GITHUB_REF_NAME
+          release/CmfTray.exe
+          release/CmfTray-win-x64.zip
+          --title "CMF Headphone Pro Tray $env:GITHUB_REF_NAME"
+          --generate-notes

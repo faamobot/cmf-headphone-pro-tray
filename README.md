@@ -21,16 +21,19 @@ contains `Headphone Pro` and uses the NT Link Bluetooth control service.
 
 ### Option A: download a release
 
-Open [Releases](https://github.com/faamobot/cmf-headphone-pro-tray/releases) and download the
-latest `CmfTray.exe` asset. If there are no releases yet, use Option B to build it yourself.
+Open [Releases](https://github.com/faamobot/cmf-headphone-pro-tray/releases/latest) and download
+`CmfTray.exe` for the simplest setup, or `CmfTray-win-x64.zip` if you prefer a folder containing
+the app and this guide. These are self-contained Windows x64 builds; you do not need Git, Visual
+Studio, or the .NET SDK to run them. The release files are generated automatically for tagged
+versions.
 
 1. Pair CMF Headphone Pro in **Windows Settings → Bluetooth & devices** and connect it to this PC.
 2. Run `CmfTray.exe`. The app stays in the notification area; it does not open a regular window.
 3. Left-click the headphone tray icon to open the controls. Right-click it for reconnect, device,
    and Start with Windows options.
 
-The published release is self-contained, so it does not require a separate .NET installation.
-Windows SmartScreen may warn because community builds are unsigned.
+Extract the ZIP if you chose it, then run `CmfTray.exe`. Windows SmartScreen may warn because
+community builds are unsigned; only run builds you trust.
 
 ### Option B: build from source
 
@@ -60,6 +63,18 @@ dotnet publish -c Release -r win-x64 --self-contained true `
 
 The published executable is written to
 `bin\Release\net8.0-windows\win-x64\publish\CmfTray.exe`.
+
+## Get a ready-to-run build
+
+Every version tag such as `v1.0.1` starts the Windows release workflow. GitHub Actions builds the
+self-contained executable and publishes both `CmfTray.exe` and `CmfTray-win-x64.zip` on the
+[Releases page](https://github.com/faamobot/cmf-headphone-pro-tray/releases). You can also run the
+workflow by pushing a new version tag:
+
+```powershell
+git tag v1.0.1
+git push user-github v1.0.1
+```
 
 ## Troubleshooting
 
