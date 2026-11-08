@@ -20,12 +20,14 @@ public sealed class TrayApp : IDisposable
     private readonly DispatcherTimer _reconnectTimer = new() { Interval = TimeSpan.FromSeconds(6) };
     private readonly DispatcherTimer _trimTimer = new() { Interval = TimeSpan.FromMinutes(2) };
 
-    private Protocol.Cell _battery;
     private Protocol.AncMode? _ancMode;
+    private bool _latencyEnabled;
     private bool _bassEnabled;
     private int _bassLevel;
     private RfcommClient.Candidate? _device;
     private volatile bool _connecting;
+    private int _connectionGeneration;
+    private int _initialStateReady;
 
     public TrayApp(System.Windows.Application wpf)
     {
@@ -34,7 +36,7 @@ public sealed class TrayApp : IDisposable
         _tray = new NotifyIcon
         {
             Icon = MakeIcon(false),
-            Text = "CMF Tray — disconnected",
+            Text = "CMF Headphone Pro — disconnected",
             Visible = true,
             ContextMenuStrip = new ContextMenuStrip(),
         };
@@ -42,6 +44,7 @@ public sealed class TrayApp : IDisposable
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) _flyout.ToggleAtTray(); };
 
         _flyout.SetAnc = mode => { TrySend(Protocol.SetAnc(mode)); DelayedRead(); };
+        _flyout.SetLatency = SetLatencyMode;
         _flyout.SetBassEnabled = on => { _bassEnabled = on; TrySend(Protocol.SetEnhancedBass(on, _bassLevel)); };
         _flyout.SetBassLevel = lvl => { _bassLevel = lvl; TrySend(Protocol.SetEnhancedBass(_bassEnabled, lvl)); };
         _flyout.OnShown = RefreshState;
@@ -51,9 +54,16 @@ public sealed class TrayApp : IDisposable
         _client.Log += _ => { };
 
         // Battery refresh + a liveness poll (a failed send flips us to disconnected).
-        _battTimer.Tick += (_, _) => { if (_client.IsConnected) TrySend(Protocol.ReadBattery()); };
-        _stateTimer.Tick += (_, _) => { if (_client.IsConnected) TrySend(Protocol.ReadAnc()); };
-        // Cheap watcher: only opens the control channel when the buds are on THIS PC.
+        _battTimer.Tick += (_, _) => { if (CanQueryDevice) TrySend(Protocol.ReadBattery()); };
+        _stateTimer.Tick += (_, _) =>
+        {
+            if (CanQueryDevice)
+            {
+                TrySend(Protocol.ReadAnc());
+                TrySend(Protocol.ReadLatency());
+            }
+        };
+        // Cheap watcher: only opens the control channel when the headphones are on THIS PC.
         _reconnectTimer.Tick += (_, _) => { if (!_client.IsConnected) BeginAutoConnect(); };
         // Keep the idle footprint small.
         _trimTimer.Tick += (_, _) => TrimMemory();
@@ -62,7 +72,7 @@ public sealed class TrayApp : IDisposable
         _reconnectTimer.Start();
         _trimTimer.Start();
 
-        _flyout.UpdateConnected("CMF Buds", false);
+        _flyout.UpdateConnected("CMF Headphone Pro", false);
         // First connection attempt is deferred to the reconnect timer so startup stays light.
         // Trim the working set a few seconds after launch, once WPF/Bluetooth init settles.
         var warmup = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
@@ -72,9 +82,10 @@ public sealed class TrayApp : IDisposable
 
     private void RefreshState()
     {
-        if (!_client.IsConnected) return;
+        if (!CanQueryDevice) return;
         TrySend(Protocol.ReadBattery());
         TrySend(Protocol.ReadAnc());
+        TrySend(Protocol.ReadLatency());
         TrySend(Protocol.ReadEnhancedBass());
     }
 
@@ -88,16 +99,17 @@ public sealed class TrayApp : IDisposable
         m.Items.Add(new ToolStripMenuItem(_client.IsConnected ? $"● {_device?.Name ?? "Connected"}" : "○ Disconnected") { Enabled = false });
         m.Items.Add(new ToolStripSeparator());
 
-        bool ancOn = _ancMode is Protocol.AncMode.AncHigh or Protocol.AncMode.AncMid or Protocol.AncMode.AncLow;
+        bool ancOn = _ancMode is Protocol.AncMode.AncHigh or Protocol.AncMode.AncMid or
+            Protocol.AncMode.AncLow or Protocol.AncMode.AncAdaptive;
         var anc = new ToolStripMenuItem("Noise Control") { Enabled = _client.IsConnected };
         anc.DropDownItems.Add(AncItem("Noise Cancellation", Protocol.AncMode.AncHigh, ancOn));
         anc.DropDownItems.Add(AncItem("Transparency", Protocol.AncMode.Transparency, _ancMode == Protocol.AncMode.Transparency));
         anc.DropDownItems.Add(AncItem("Off", Protocol.AncMode.Off, _ancMode == Protocol.AncMode.Off));
         m.Items.Add(anc);
 
-        var lat = new ToolStripMenuItem("Low-lag mode") { Enabled = _client.IsConnected };
-        lat.DropDownItems.Add(new ToolStripMenuItem("On", null, (_, _) => TrySend(Protocol.SetLatency(true))));
-        lat.DropDownItems.Add(new ToolStripMenuItem("Off", null, (_, _) => TrySend(Protocol.SetLatency(false))));
+        var lat = new ToolStripMenuItem("Low Latency Mode (Game Mode)") { Enabled = _client.IsConnected };
+        lat.DropDownItems.Add(new ToolStripMenuItem("On", null, (_, _) => SetLatencyMode(true)) { Checked = _latencyEnabled });
+        lat.DropDownItems.Add(new ToolStripMenuItem("Off", null, (_, _) => SetLatencyMode(false)) { Checked = !_latencyEnabled });
         m.Items.Add(lat);
 
         m.Items.Add(new ToolStripSeparator());
@@ -137,10 +149,21 @@ public sealed class TrayApp : IDisposable
         t.Start();
     }
 
+    private void SetLatencyMode(bool enabled)
+    {
+        _latencyEnabled = enabled;
+        _flyout.UpdateLatency(enabled);
+        TrySend(Protocol.SetLatency(enabled));
+
+        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
+        t.Tick += (_, _) => { t.Stop(); if (_client.IsConnected) TrySend(Protocol.ReadLatency()); };
+        t.Start();
+    }
+
     // ---------------------------------------------------------------- connection
 
     /// <summary>
-    /// Cheaply check whether the earbuds are actually connected to this PC, and only then open
+    /// Cheaply check whether the Headphone Pro is actually connected to this PC, and only then open
     /// the control channel. When they're not present we do nothing — no blocking connect attempts,
     /// no background churn. This is what keeps the idle footprint tiny.
     /// </summary>
@@ -152,13 +175,13 @@ public sealed class TrayApp : IDisposable
         {
             try
             {
-                var list = RfcommClient.ListPairedEarbuds();
+                var list = RfcommClient.ListPairedHeadphonePros();
                 var target = list.Count > 0 ? list[0] : null;
 
                 // Not paired, or not currently connected to this PC → stay idle and quiet.
                 if (target is null || !target.Connected)
                 {
-                    Post(() => _flyout.UpdateConnected(target?.Name ?? _device?.Name ?? "CMF Buds", false));
+                    Post(() => _flyout.UpdateConnected(target?.Name ?? _device?.Name ?? "CMF Headphone Pro", false));
                     return;
                 }
 
@@ -167,7 +190,7 @@ public sealed class TrayApp : IDisposable
             }
             catch
             {
-                Post(() => _flyout.UpdateConnected(_device?.Name ?? "CMF Buds", false));
+                Post(() => _flyout.UpdateConnected(_device?.Name ?? "CMF Headphone Pro", false));
             }
             finally { _connecting = false; }
         });
@@ -175,8 +198,8 @@ public sealed class TrayApp : IDisposable
 
     private void ChooseDevice()
     {
-        var list = RfcommClient.ListPairedEarbuds();
-        if (list.Count == 0) { Notify("No paired devices found. Pair your earbuds in Windows Settings."); return; }
+        var list = RfcommClient.ListPairedHeadphonePros();
+        if (list.Count == 0) { Notify("No paired CMF Headphone Pro found in Windows Bluetooth settings."); return; }
         using var dlg = new DevicePicker(list);
         if (dlg.ShowDialog() == DialogResult.OK && dlg.Selected is { } sel && !_connecting)
         {
@@ -198,25 +221,28 @@ public sealed class TrayApp : IDisposable
                 _tray.Text = $"CMF Tray — {c.Name}";
                 _flyout.UpdateConnected(c.Name, true);
             });
-            RefreshState();
+            BeginDeviceInitialization();
         }
         catch
         {
-            // Buds are elsewhere (e.g. on the phone) or unreachable — stay quiet; the timer retries.
+            // Headphones are elsewhere (e.g. on another device) or unreachable — the timer retries.
             _client.Disconnect();
-            Post(() => _flyout.UpdateConnected(_device?.Name ?? "CMF Buds", false));
+            Post(() => _flyout.UpdateConnected(_device?.Name ?? "CMF Headphone Pro", false));
         }
     }
 
     private void OnDisconnected()
     {
+        Interlocked.Increment(ref _connectionGeneration);
+        Interlocked.Exchange(ref _initialStateReady, 0);
         _tray.Icon = MakeIcon(false);
-        _tray.Text = "CMF Tray — disconnected";
-        _battery = default;
+        _tray.Text = "CMF Headphone Pro — disconnected";
         _ancMode = null;
-        _flyout.UpdateConnected(_device?.Name ?? "CMF Buds", false);
+        _latencyEnabled = false;
+        _flyout.UpdateConnected(_device?.Name ?? "CMF Headphone Pro", false);
         _flyout.UpdateBattery(default);
         _flyout.UpdateAnc(null);
+        _flyout.UpdateLatency(false);
         TrimMemory(); // going idle — release memory back
     }
 
@@ -243,8 +269,8 @@ public sealed class TrayApp : IDisposable
                 var b = Protocol.ParseBattery(frame);
                 Post(() =>
                 {
-                    _battery = b;
-                    _tray.Text = $"CMF Tray — L{b.LeftPct}% R{b.RightPct}% Case{b.CasePct}%";
+                    string battery = b.BatteryPct is null ? "battery —" : $"{b.BatteryPct}%";
+                    _tray.Text = $"CMF Headphone Pro — {battery}";
                     _flyout.UpdateBattery(b);
                 });
                 break;
@@ -253,6 +279,20 @@ public sealed class TrayApp : IDisposable
             {
                 var mode = Protocol.ParseAnc(frame);
                 if (mode is not null) Post(() => { _ancMode = mode; _flyout.UpdateAnc(mode); });
+                break;
+            }
+            case 0x4006:
+            {
+                // A fresh NT Link session may ignore normal reads until this info query completes.
+                if (Interlocked.Exchange(ref _initialStateReady, 1) == 0)
+                    Post(RefreshState);
+                break;
+            }
+            case 0x4041:
+            {
+                var enabled = Protocol.ParseLatency(frame);
+                if (enabled is not null)
+                    Post(() => { _latencyEnabled = enabled.Value; _flyout.UpdateLatency(enabled.Value); });
                 break;
             }
             case 0x404E:
@@ -268,6 +308,24 @@ public sealed class TrayApp : IDisposable
 
     private void Post(Action a) => _flyout.Dispatcher.BeginInvoke(a);
 
+    private bool CanQueryDevice => _client.IsConnected && Volatile.Read(ref _initialStateReady) != 0;
+
+    private void BeginDeviceInitialization()
+    {
+        int generation = Interlocked.Increment(ref _connectionGeneration);
+        Interlocked.Exchange(ref _initialStateReady, 0);
+        TrySend(Protocol.ReadDeviceInfo());
+        _ = ContinueInitializationAfterTimeoutAsync(generation);
+    }
+
+    private async Task ContinueInitializationAfterTimeoutAsync(int generation)
+    {
+        // Older Nothing/CMF models may not answer device-info; do not block normal reads forever.
+        await Task.Delay(TimeSpan.FromMilliseconds(1500));
+        if (generation != Volatile.Read(ref _connectionGeneration) || !_client.IsConnected) return;
+        if (Interlocked.Exchange(ref _initialStateReady, 1) == 0) Post(RefreshState);
+    }
+
     private void Notify(string msg) => _tray.ShowBalloonTip(4000, "CMF Tray", msg, ToolTipIcon.Info);
 
     // Trim the working set so an idle tray app doesn't sit on ~100 MB of RAM.
@@ -275,8 +333,8 @@ public sealed class TrayApp : IDisposable
     [DllImport("psapi.dll")] private static extern bool EmptyWorkingSet(IntPtr hProcess);
     private static void TrimMemory() { try { EmptyWorkingSet(GetCurrentProcess()); } catch { } }
 
-    /// <summary>Tray icon: the Nothing/CMF earbuds logo (white when connected, grey when not).</summary>
-    private static Icon MakeIcon(bool connected) => IconFactory.MakeFromSvg(connected);
+    /// <summary>Tray icon: over-ear headphone silhouette (white when connected, grey when not).</summary>
+    private static Icon MakeIcon(bool connected) => IconFactory.Make(IconFactory.Style.Headphone, connected);
 
     private void Quit()
     {

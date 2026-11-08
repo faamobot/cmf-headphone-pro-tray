@@ -11,7 +11,7 @@ public sealed class DevicePicker : Form
     public DevicePicker(IReadOnlyList<RfcommClient.Candidate> items)
     {
         _items = items;
-        Text = "Choose earbuds";
+        Text = "Choose CMF Headphone Pro";
         Width = 360;
         Height = 300;
         StartPosition = FormStartPosition.CenterScreen;

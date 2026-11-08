@@ -3,12 +3,10 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
-using System.Windows.Shapes;
 using Brush = System.Windows.Media.Brush;
 using Brushes = System.Windows.Media.Brushes;
 using Color = System.Windows.Media.Color;
 using SolidColorBrush = System.Windows.Media.SolidColorBrush;
-using Rectangle = System.Windows.Shapes.Rectangle;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
 
 namespace CmfTray;
@@ -19,16 +17,18 @@ public partial class FlyoutWindow : Window
     private static readonly Brush Dark = new SolidColorBrush(Color.FromRgb(0x1E, 0x1E, 0x1E));
     private static readonly Brush Clear = Brushes.Transparent;
 
-    private const int TrackWidth = 30;   // battery bar width (design units)
+    private const int BatteryFillWidth = 12; // battery icon interior width (design units)
     private const int SliderSpan = 200;  // usable slider width for the bass fill
     private const int MaxBass = 5;
 
     public Action<Protocol.AncMode>? SetAnc;
+    public Action<bool>? SetLatency;
     public Action<bool>? SetBassEnabled;
     public Action<int>? SetBassLevel;
     public Action? OnShown;
 
     private Protocol.AncMode? _anc;
+    private bool _latencyOn;
     private bool _bassOn;
     private int _bassLevel;
     private DateTime _lastHide = DateTime.MinValue;
@@ -38,6 +38,7 @@ public partial class FlyoutWindow : Window
         InitializeComponent();
         Dark.Freeze();
         RefreshAnc();
+        RefreshLatency();
         RefreshBass();
     }
 
@@ -83,9 +84,24 @@ public partial class FlyoutWindow : Window
     }
 
     // ---------- click handlers ----------
-    private void SegNoise_Click(object sender, MouseButtonEventArgs e) => SetAnc?.Invoke(Protocol.AncMode.AncHigh);
-    private void SegTrans_Click(object sender, MouseButtonEventArgs e) => SetAnc?.Invoke(Protocol.AncMode.Transparency);
-    private void SegOff_Click(object sender, MouseButtonEventArgs e) => SetAnc?.Invoke(Protocol.AncMode.Off);
+    private void SegNoise_Click(object sender, MouseButtonEventArgs e) => SelectAnc(Protocol.AncMode.AncHigh);
+    private void SegTrans_Click(object sender, MouseButtonEventArgs e) => SelectAnc(Protocol.AncMode.Transparency);
+    private void SegOff_Click(object sender, MouseButtonEventArgs e) => SelectAnc(Protocol.AncMode.Off);
+
+    private void SelectAnc(Protocol.AncMode mode)
+    {
+        // Update immediately; a later device read/event remains authoritative if the command fails.
+        _anc = mode;
+        RefreshAnc();
+        SetAnc?.Invoke(mode);
+    }
+
+    private void LatencyToggle_Click(object sender, MouseButtonEventArgs e)
+    {
+        _latencyOn = !_latencyOn;
+        RefreshLatency();
+        SetLatency?.Invoke(_latencyOn);
+    }
 
     private void BassToggle_Click(object sender, MouseButtonEventArgs e)
     {
@@ -106,14 +122,11 @@ public partial class FlyoutWindow : Window
     // ---------- state from device ----------
     public void UpdateBattery(Protocol.Cell b)
     {
-        Set(BatLPct, BatLFill, b.LeftPct, b.LeftCharging);
-        Set(BatRPct, BatRFill, b.RightPct, b.RightCharging);
-
-        static void Set(System.Windows.Controls.TextBlock pct, Rectangle fill, int? v, bool charging)
-        {
-            pct.Text = v is null ? "—" : $"{v}%";
-            fill.Width = v is null ? 0 : Math.Clamp(v.Value / 100.0 * TrackWidth, 0, TrackWidth);
-        }
+        BatteryPct.Text = b.BatteryPct is null ? "—" : $"{b.BatteryPct}%";
+        BatFill.Width = b.BatteryPct is null
+            ? 0
+            : Math.Clamp(b.BatteryPct.Value / 100.0 * BatteryFillWidth, 0, BatteryFillWidth);
+        BatteryIcon.ToolTip = b.BatteryCharging ? "Headphone battery — charging" : "Headphone battery";
     }
 
     public void UpdateConnected(string name, bool connected)
@@ -130,6 +143,12 @@ public partial class FlyoutWindow : Window
         RefreshAnc();
     }
 
+    public void UpdateLatency(bool enabled)
+    {
+        _latencyOn = enabled;
+        RefreshLatency();
+    }
+
     public void UpdateBass(bool enabled, int level)
     {
         _bassOn = enabled;
@@ -140,7 +159,8 @@ public partial class FlyoutWindow : Window
     // ---------- visuals ----------
     private void RefreshAnc()
     {
-        bool nc = _anc is Protocol.AncMode.AncHigh or Protocol.AncMode.AncMid or Protocol.AncMode.AncLow;
+        bool nc = _anc is Protocol.AncMode.AncHigh or Protocol.AncMode.AncMid or
+            Protocol.AncMode.AncLow or Protocol.AncMode.AncAdaptive;
         bool tr = _anc == Protocol.AncMode.Transparency;
         bool off = _anc == Protocol.AncMode.Off;
 
@@ -166,6 +186,13 @@ public partial class FlyoutWindow : Window
         BassKnob.HorizontalAlignment = _bassOn ? HorizontalAlignment.Right : HorizontalAlignment.Left;
 
         BassFill.Width = _bassLevel <= 0 ? 0 : _bassLevel / (double)MaxBass * SliderSpan;
+    }
+
+    private void RefreshLatency()
+    {
+        LatencyToggleBg.Background = _latencyOn ? White : (Brush)FindResource("InsetBg");
+        LatencyKnob.Fill = _latencyOn ? Dark : White;
+        LatencyKnob.HorizontalAlignment = _latencyOn ? HorizontalAlignment.Right : HorizontalAlignment.Left;
     }
 
     // ---------- show / hide ----------

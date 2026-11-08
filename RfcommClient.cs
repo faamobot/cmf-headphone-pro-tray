@@ -6,7 +6,7 @@ using InTheHand.Net.Sockets;
 namespace CmfTray;
 
 /// <summary>
-/// Opens the earbuds' SPP control channel and pumps framed packets in/out.
+/// Opens the CMF Headphone Pro's NT Link RFCOMM control channel and pumps framed packets in/out.
 /// One physical connection; reads run on a background thread and surface as <see cref="FrameReceived"/>.
 /// </summary>
 public sealed class RfcommClient : IDisposable
@@ -19,36 +19,28 @@ public sealed class RfcommClient : IDisposable
     public bool IsConnected => _stream is not null && _running;
     public string? DeviceName { get; private set; }
 
-    /// <summary>Raised on the reader thread whenever a complete 0x55 0x60 frame arrives.</summary>
+    /// <summary>Raised on the reader thread for each complete NT Link frame (including pushed events).</summary>
     public event Action<byte[]>? FrameReceived;
     public event Action<string>? Log;
     public event Action? Disconnected;
 
     public sealed record Candidate(string Name, BluetoothAddress Address, bool Authenticated, bool Connected);
 
-    /// <summary>Paired devices whose name looks like Nothing/CMF earbuds (best guess, plus everything else).</summary>
-    public static IReadOnlyList<Candidate> ListPairedEarbuds()
+    /// <summary>Find the paired CMF Headphone Pro devices this fork is designed to control.</summary>
+    public static IReadOnlyList<Candidate> ListPairedHeadphonePros()
     {
         using var cli = new BluetoothClient();
-        var all = cli.PairedDevices
+        return cli.PairedDevices
             .Select(d => new Candidate(d.DeviceName ?? "(unknown)", d.DeviceAddress, d.Authenticated, d.Connected))
+            .Where(c => c.Name.Contains("Headphone Pro", StringComparison.OrdinalIgnoreCase))
             .ToList();
-
-        static bool Looks(string n) =>
-            n.Contains("CMF", StringComparison.OrdinalIgnoreCase) ||
-            n.Contains("Nothing", StringComparison.OrdinalIgnoreCase) ||
-            n.Contains("Buds", StringComparison.OrdinalIgnoreCase) ||
-            n.Contains("Ear", StringComparison.OrdinalIgnoreCase);
-
-        // Likely earbuds first, then the rest so the user can still pick.
-        return all.OrderByDescending(c => Looks(c.Name)).ToList();
     }
 
     public void Connect(BluetoothAddress address, string name)
     {
         Disconnect();
         _client = new BluetoothClient();
-        Log?.Invoke($"Connecting to {name} [{address}] on SPP {Protocol.SppServiceUuid}…");
+        Log?.Invoke($"Connecting to {name} on NT Link RFCOMM {Protocol.SppServiceUuid}…");
         _client.Connect(address, Protocol.SppServiceUuid);
         _stream = _client.GetStream();
         DeviceName = name;
@@ -93,15 +85,18 @@ public sealed class RfcommClient : IDisposable
         }
     }
 
-    /// <summary>Split the byte stream into individual 0x55 0x60 … frames using the length field.</summary>
+    /// <summary>
+    /// Split the stream using its payload length and control-word CRC flag. Replies use 0x55 0x60
+    /// with a CRC; Headphone Pro state events can use 0x55 0x00 with no CRC.
+    /// </summary>
     private void DrainFrames(List<byte> acc)
     {
         while (true)
         {
-            // Find frame start.
+            // Find the next frame start. State events do not use the 0x60 control byte.
             int start = -1;
-            for (int i = 0; i + 1 < acc.Count; i++)
-                if (acc[i] == 0x55 && acc[i + 1] == 0x60) { start = i; break; }
+            for (int i = 0; i + 2 < acc.Count; i++)
+                if (acc[i] == 0x55 && (acc[i + 1] is 0x00 or 0x20 or 0x60)) { start = i; break; }
             if (start < 0)
             {
                 if (acc.Count > 512) acc.Clear(); // resync guard
@@ -111,7 +106,8 @@ public sealed class RfcommClient : IDisposable
 
             if (acc.Count < 8) return;            // need header
             int payloadLen = acc[5];
-            int total = 8 + payloadLen + 2;       // header + payload + crc
+            bool hasCrc = (acc[1] & 0x20) != 0;
+            int total = 8 + payloadLen + (hasCrc ? 2 : 0);
             if (acc.Count < total) return;        // wait for the rest
 
             var frame = acc.GetRange(0, total).ToArray();

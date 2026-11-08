@@ -162,9 +162,10 @@ internal static class Program
     {
         var wpf = new System.Windows.Application();
         var win = new FlyoutWindow();
-        win.UpdateConnected("CMF Buds", true);
-        win.UpdateBattery(new Protocol.Cell(100, 100, 50, false, false, false));
+        win.UpdateConnected("CMF Headphone Pro", true);
+        win.UpdateBattery(new Protocol.Cell(100, false));
         win.UpdateAnc(Protocol.AncMode.Transparency);
+        win.UpdateLatency(true);
         win.UpdateBass(true, 3);
         win.WindowStartupLocation = System.Windows.WindowStartupLocation.CenterScreen;
         win.Show();
@@ -185,9 +186,9 @@ internal static class Program
     [DllImport("kernel32.dll")] private static extern bool AllocConsole();
 
     /// <summary>
-    /// Console diagnostic: list paired devices, connect to the chosen one, and dump battery /
-    /// firmware / ANC responses. Proves the SPP channel works before touching the UI.
-    /// Usage:  CmfTray --probe           (auto-picks the first likely earbuds)
+    /// Console diagnostic: connect to a paired CMF Headphone Pro and dump battery / firmware /
+    /// ANC / low-latency responses. Proves the control channel works before touching the UI.
+    /// Usage:  CmfTray --probe           (auto-picks the first paired Headphone Pro)
     ///         CmfTray --probe 2         (pick candidate index 2 from the list)
     /// </summary>
     private static StreamWriter? _log;
@@ -202,19 +203,19 @@ internal static class Program
         AllocConsole();
         try { _log = new StreamWriter(Path.Combine(AppContext.BaseDirectory, "probe-log.txt"), append: false); }
         catch { }
-        Out("=== CMF Tray — SPP probe ===\n");
+        Out("=== CMF Tray — Headphone Pro probe ===\n");
 
-        var candidates = RfcommClient.ListPairedEarbuds();
+        var candidates = RfcommClient.ListPairedHeadphonePros();
         if (candidates.Count == 0)
         {
-            Console.WriteLine("No paired Bluetooth devices found. Pair your earbuds in Windows Settings first.");
+            Console.WriteLine("No paired CMF Headphone Pro found. Pair it in Windows Bluetooth settings first.");
             Pause();
             return 1;
         }
 
         Out("Paired devices:");
         for (int i = 0; i < candidates.Count; i++)
-            Out($"  [{i}] {candidates[i].Name}  ({candidates[i].Address})" +
+            Out($"  [{i}] {candidates[i].Name}  (Bluetooth address omitted)" +
                 (candidates[i].Connected ? "  [connected]" : "") +
                 (candidates[i].Authenticated ? "" : "  (not authenticated)"));
 
@@ -226,11 +227,16 @@ internal static class Program
         Out($"\nUsing [{idx}] {chosen.Name}\n");
 
         using var client = new RfcommClient();
+        var deviceInfoReceived = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         client.Log += m => Out($"  · {m}");
         client.FrameReceived += frame =>
         {
             ushort cmd = Protocol.GetCommand(frame);
-            Out($"  <- {Protocol.Hex(frame)}  (cmd 0x{cmd:X4})");
+            // Device-info includes a serial number and Bluetooth address; never log that payload.
+            Out(cmd == 0x4006
+                ? "  <- device-info response (identity fields omitted)  (cmd 0x4006)"
+                : $"  <- {Protocol.Hex(frame)}  (cmd 0x{cmd:X4})");
+            if (cmd == 0x4006) deviceInfoReceived.TrySetResult(true);
             HandleProbeFrame(cmd, frame);
         };
 
@@ -241,22 +247,23 @@ internal static class Program
         catch (Exception ex)
         {
             Out($"\nCONNECT FAILED: {ex.Message}");
-            Out("If this says the service is unreachable, the buds may need to be in the case-open/" +
-                "connected state, or another app already holds the SPP channel.");
+            Out("If this says the service is unreachable, make sure the headphones are connected " +
+                "to this PC and Nothing X or another controller has released the control channel.");
             Pause();
             return 2;
         }
 
+        Out("\nPriming the control session with device-info…");
+        Send(client, "device info", Protocol.ReadDeviceInfo());
+        if (!deviceInfoReceived.Task.Wait(TimeSpan.FromMilliseconds(1500)))
+            Out("  No device-info response within 1.5s; continuing with state queries.");
+
         Out("\nSending queries…");
         Send(client, "battery",  Protocol.ReadBattery());
         Thread.Sleep(200);
-        Send(client, "firmware", Protocol.ReadFirmware());
-        Thread.Sleep(200);
         Send(client, "anc read", Protocol.ReadAnc());
         Thread.Sleep(200);
-        Send(client, "eq read",  Protocol.Build(Protocol.CmdReadEq));
-        Thread.Sleep(200);
-        Send(client, "listen md", Protocol.Build(Protocol.CmdReadListenMode));
+        Send(client, "latency", Protocol.ReadLatency());
 
         Out("\nListening for responses for 5s…");
         Thread.Sleep(5000);
@@ -278,24 +285,30 @@ internal static class Program
         catch { }
         Out("=== CMF Tray — ANC mapping ===\n");
 
-        var candidates = RfcommClient.ListPairedEarbuds();
+        var candidates = RfcommClient.ListPairedHeadphonePros();
+        if (candidates.Count == 0) { Out("No paired CMF Headphone Pro found."); Pause(); return 1; }
         int idx = 0;
         var idxArg = args.FirstOrDefault(a => int.TryParse(a, out _));
         if (idxArg is not null) idx = Math.Clamp(int.Parse(idxArg), 0, candidates.Count - 1);
-        if (candidates.Count == 0) { Out("No paired devices."); Pause(); return 1; }
         var chosen = candidates[idx];
         Out($"Using [{idx}] {chosen.Name}\n");
 
         using var client = new RfcommClient();
+        var deviceInfoReceived = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         client.Log += m => Out($"  · {m}");
         client.FrameReceived += frame =>
         {
             ushort cmd = Protocol.GetCommand(frame);
+            if (cmd == 0x4006) deviceInfoReceived.TrySetResult(true);
             if (cmd is 0x401E or 0xE003 or 0x401F) _lastAncRead = frame;
         };
 
         try { client.Connect(chosen.Address, chosen.Name); }
         catch (Exception ex) { Out($"CONNECT FAILED: {ex.Message}"); Pause(); return 2; }
+
+        client.Send(Protocol.ReadDeviceInfo());
+        if (!deviceInfoReceived.Task.Wait(TimeSpan.FromMilliseconds(1500)))
+            Out("No device-info response within 1.5s; continuing.");
 
         // Capture original.
         client.Send(Protocol.ReadAnc());
@@ -326,12 +339,12 @@ internal static class Program
             Out($"      read-back  {read}");
         }
 
-        // Restore original mode if we can identify it (trailing 01 <mode> 00 group).
-        if (original is not null && original.Length >= 14)
+        // Restore the mode from the kind-1 field; kind-2 is ANC strength on Headphone Pro.
+        var originalMode = original is null ? null : Protocol.ParseAnc(original);
+        if (originalMode is not null)
         {
-            byte origMode = original[12];
-            Out($"\nRestoring original mode 0x{origMode:X2}…");
-            client.Send(Protocol.Build(Protocol.CmdSetAnc, 0x01, origMode, 0x00));
+            Out($"\nRestoring original mode 0x{(byte)originalMode.Value:X2}…");
+            client.Send(Protocol.SetAnc(originalMode.Value));
             Thread.Sleep(300);
         }
 
@@ -352,12 +365,18 @@ internal static class Program
         if (cmd is 0x4007 or 0xE001)
         {
             var b = Protocol.ParseBattery(frame);
-            Out($"     BATTERY  L={Fmt(b.LeftPct, b.LeftCharging)} " +
-                $"R={Fmt(b.RightPct, b.RightCharging)} Case={Fmt(b.CasePct, b.CaseCharging)}");
+            Out($"     BATTERY  {Fmt(b.BatteryPct, b.BatteryCharging)}");
         }
-        else if (cmd == 0x4042)
+        else if (cmd == 0x4041)
         {
-            Out($"     FIRMWARE {Protocol.ParseFirmware(frame)}");
+            var latency = Protocol.ParseLatency(frame);
+            string state = latency is null ? "(unparsed)" : latency.Value ? "ON" : "OFF";
+            Out($"     LOW LATENCY {state}");
+        }
+        else if (cmd == 0x4006)
+        {
+            var version = Protocol.ParseDeviceInfo(frame);
+            Out($"     DEVICE INFO firmware={version.Firmware} software={version.Software}; identity fields withheld.");
         }
     }
 

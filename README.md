@@ -1,8 +1,8 @@
 # CMF Tray
 
-A tiny Windows tray app to control **CMF / Nothing earbuds** — noise control, Ultra bass, and
-battery — right from your taskbar, without the phone app. It talks to the earbuds' Bluetooth
-control channel (the same one the official Nothing X app uses).
+A Windows tray controller for **CMF Headphone Pro**. It controls noise modes, Low Latency (Game)
+Mode, Ultra bass, and the headset battery from the taskbar without the Nothing X app. It talks to
+the headphones' NT Link Bluetooth control channel.
 
 <!-- Add a screenshot here after your first release: ![screenshot](docs/screenshot.png) -->
 
@@ -20,24 +20,24 @@ control channel (the same one the official Nothing X app uses).
 There's nothing to install and no .NET required — the app is self-contained.
 
 ### First-time setup
-- Your earbuds must be **paired** in Windows (Settings → Bluetooth) and **connected to this PC**
-  (not your phone — CMF/Nothing buds connect to one device at a time unless multipoint is on).
+- Your CMF Headphone Pro must be **paired** in Windows (Settings → Bluetooth) and connected to
+  this PC. The app finds devices whose Windows name contains “Headphone Pro”.
 - Turn on **Start with Windows** from the right-click menu so it launches automatically.
 
 ## Features
 
-- **Noise control** — Noise cancellation / Transparency / Off
+- **Noise control** — Noise cancellation / Transparency / Off, with live status updates
+- **Low Latency Mode (Game Mode)** — on/off with read-back state synchronization
 - **Ultra bass** — on/off + level
-- **Battery** — left and right earbud
-- Live updates — changing the mode on the earbuds reflects in the panel automatically
-- Auto-reconnect when the buds come back to this PC
+- **Battery** — one headset battery percentage and icon
+- Auto-reconnect when the headphones come back to this PC
 - Optional launch at login
 
-## Supported earbuds
+## Supported device
 
-Built and tested against **CMF Buds**. Should also work with other Nothing/CMF models that use
-the same protocol (Ear, Ear (a), CMF Buds Pro, …), though some may need small tweaks. If yours
-behaves oddly, open an issue with your model and firmware version.
+This fork targets **CMF Headphone Pro**. Its NT Link channel, device-info session priming, single
+battery component, ANC mode payload, and Low Latency command were taken from a hardware capture
+and can be checked with the included `--probe` tool. See the [community protocol capture](https://github.com/ncr/omarchy-headphones/blob/main/docs/captures/nothing-headphone-pro.txt).
 
 ## Requirements
 
@@ -58,8 +58,10 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 ```
 
 ### Diagnostic modes
-- `CmfTray.exe --probe` — lists paired devices, connects, and dumps battery/firmware/ANC responses
-- `CmfTray.exe --anc-map` — maps ANC mode command bytes against your hardware
+- `CmfTray.exe --probe` — connects, primes NT Link, and dumps battery/firmware/ANC/latency responses
+- The probe log omits the headset serial number and Bluetooth address.
+- `CmfTray.exe --anc-map` — maps ANC mode command bytes against your hardware and restores the
+  original mode
 - `CmfTray.exe --shot` — renders the panel to `flyout-shot.png`
 
 ## License

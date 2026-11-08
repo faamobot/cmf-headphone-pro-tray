@@ -9,11 +9,12 @@ namespace CmfTray;
 ///   [0x55, 0x60, 0x01, cmdLo, cmdHi, payloadLen, 0x00, seq, ...payload, crcLo, crcHi]
 ///
 /// CRC is CRC-16 (reflected, init 0xFFFF, poly 0xA001) over every byte before the CRC.
-/// Reverse-engineered by the radiance-project/ear-web team; verified against CMF (B172/B168).
+/// Reverse-engineered by the community; CMF Headphone Pro uses the same NT Link frames on
+/// RFCOMM channel 28 and requires a device-info query before normal state queries.
 /// </summary>
 public static class Protocol
 {
-    // The SPP service the earbuds expose for control (separate from A2DP/HFP audio).
+    // The NT Link RFCOMM service exposed for control (separate from A2DP/HFP audio).
     public static readonly Guid SppServiceUuid = Guid.Parse("aeac4a03-dff5-498f-843a-34487cf133eb");
 
     // --- Command IDs (16-bit) ---
@@ -24,16 +25,17 @@ public static class Protocol
     public const ushort CmdSetListenMode   = 0xF01D; // 61469  payload [level, 0x00]   (CMF: B172/B168)
     public const ushort CmdReadListenMode  = 0xC050; // 49232
     public const ushort CmdReadBattery     = 0xC007; // 49159
+    public const ushort CmdReadDeviceInfo  = 0xC006; // 49158; primes a fresh NT Link session
     public const ushort CmdReadFirmware    = 0xC042; // 49218
-    public const ushort CmdSetLatency      = 0xF040; // 61504  payload [0x01,0x00]=on, [0x02,0x00]=off
-    public const ushort CmdReadLatency     = 0xC040; // 49216
+    public const ushort CmdSetLatency      = 0xF040; // 61504  payload [0x01]=on, [0x02]=off
+    public const ushort CmdReadLatency     = 0xC041; // 49217; answer command is 0x4041
     public const ushort CmdSetInEar        = 0xF004; // 61444
     public const ushort CmdSetEnhancedBass = 0xF051; // 61521  payload [enabled, level*2]   (CMF)
     public const ushort CmdReadEnhancedBass= 0xC04E; // 49230
 
     /// <summary>
-    /// ANC modes as the device encodes them in payload[1] and reports at read byte[12].
-    /// NOTE: verified on CMF Buds — Adaptive (0x04) is NOT supported there and coerces to Low.
+    /// ANC modes as the device encodes them in the kind-1 value field. CMF Headphone Pro supports
+    /// Adaptive (0x04); other Nothing/CMF models may expose a different set of supported modes.
     /// </summary>
     public enum AncMode : byte
     {
@@ -45,9 +47,24 @@ public static class Protocol
         AncAdaptive  = 0x04, // Nothing Ear / Pro only
     }
 
-    /// <summary>Current ANC mode from a read response (cmd 0x401E): mode byte sits at index 12.</summary>
-    public static AncMode? ParseAnc(byte[] d) =>
-        d.Length >= 14 ? (AncMode)d[12] : null;
+    /// <summary>
+    /// Current ANC mode from a read response (0x401E) or event (0xE003). The payload is one or
+    /// more 3-byte kind/value/reserved groups; kind 1 is the mode and kind 2 is ANC strength.
+    /// Headphone Pro sends both groups, so reading the old fixed byte 12 returns strength instead.
+    /// </summary>
+    public static AncMode? ParseAnc(byte[] d)
+    {
+        if (d.Length < 11) return null;
+        int trailerLength = (d[1] & 0x20) != 0 ? 2 : 0;
+        int end = Math.Min(d.Length - trailerLength, 8 + d[5]);
+        for (int i = 8; i + 1 < end; i += 3)
+        {
+            if (d[i] != 0x01) continue;
+            var mode = (AncMode)d[i + 1];
+            return Enum.IsDefined(typeof(AncMode), mode) ? mode : null;
+        }
+        return null;
+    }
 
     private static byte _seq = 0;
     private static byte NextSeq()
@@ -81,11 +98,36 @@ public static class Protocol
     // --- Convenience builders ---
     public static byte[] SetAnc(AncMode mode)   => Build(CmdSetAnc, 0x01, (byte)mode, 0x00);
     public static byte[] ReadBattery()          => Build(CmdReadBattery);
+    public static byte[] ReadDeviceInfo()       => Build(CmdReadDeviceInfo);
     public static byte[] ReadAnc()              => Build(CmdReadAnc);
     public static byte[] ReadFirmware()         => Build(CmdReadFirmware);
     public static byte[] SetEq(byte preset)     => Build(CmdSetEq, preset, 0x00);
     public static byte[] SetListenMode(byte m)  => Build(CmdSetListenMode, m, 0x00);
-    public static byte[] SetLatency(bool on)    => Build(CmdSetLatency, (byte)(on ? 0x01 : 0x02), 0x00);
+    public static byte[] SetLatency(bool on)    => Build(CmdSetLatency, (byte)(on ? 0x01 : 0x02));
+    public static byte[] ReadLatency()          => Build(CmdReadLatency);
+    public static bool? ParseLatency(byte[] d) =>
+        d.Length >= 9 && d[5] >= 1 ? d[8] == 0x01 : null;
+
+    public readonly record struct DeviceVersion(string Firmware, string Software);
+
+    /// <summary>Reads only version fields from device-info; serial and Bluetooth address are ignored.</summary>
+    public static DeviceVersion ParseDeviceInfo(byte[] d)
+    {
+        if (d.Length < 9) return new DeviceVersion("", "");
+        int end = Math.Min(d.Length - 2, 8 + d[5]);
+        if (end <= 8) return new DeviceVersion("", "");
+
+        string text = Encoding.ASCII.GetString(d, 8, end - 8).TrimStart('\0', '\u0004');
+        string firmware = "", software = "";
+        foreach (string line in text.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            string[] fields = line.Trim('\r').Split(',');
+            if (fields.Length < 3 || fields[0] != "6") continue;
+            if (fields[1] == "1") firmware = fields[2];
+            else if (fields[1] == "2") software = fields[2];
+        }
+        return new DeviceVersion(firmware, software);
+    }
     public static byte[] ReadEnhancedBass()     => Build(CmdReadEnhancedBass);
 
     /// <summary>Ultra bass: payload [enabled, level*2]. Supported on CMF (B172/B168) per ear-web.</summary>
@@ -116,22 +158,23 @@ public static class Protocol
     public static ushort GetCommand(byte[] data) =>
         data.Length >= 5 ? (ushort)(data[3] | (data[4] << 8)) : (ushort)0;
 
-    public static bool IsValidFrame(byte[] data) =>
-        data.Length >= 10 && data[0] == 0x55 && data[1] == 0x60;
+    public static bool IsValidFrame(byte[] data)
+    {
+        if (data.Length < 8 || data[0] != 0x55) return false;
+        int trailerLength = (data[1] & 0x20) != 0 ? 2 : 0;
+        return data.Length >= 8 + data[5] + trailerLength;
+    }
 
-    public readonly record struct Cell(int? LeftPct, int? RightPct, int? CasePct,
-                                       bool LeftCharging, bool RightCharging, bool CaseCharging);
+    public readonly record struct Cell(int? BatteryPct, bool BatteryCharging);
 
     /// <summary>
     /// Battery response: payload[0] (=index 8) is the count of reported devices; then pairs of
     /// [deviceId, value] where value&0x7F is the percentage and value&0x80 is the charging flag.
-    /// deviceId: 0x02=left, 0x03=right, 0x04=case.
+    /// CMF Headphone Pro reports its single battery as component 0x06.
     /// </summary>
     public static Cell ParseBattery(byte[] d)
     {
-        int? l = null, r = null, c = null;
-        bool lc = false, rc = false, cc = false;
-        if (d.Length < 9) return new Cell(l, r, c, lc, rc, cc);
+        if (d.Length < 9) return new Cell(null, false);
 
         int count = d[8];
         for (int i = 0; i < count; i++)
@@ -141,14 +184,9 @@ public static class Protocol
             if (valIdx >= d.Length) break;
             int pct = d[valIdx] & 0x7F;
             bool charging = (d[valIdx] & 0x80) != 0;
-            switch (d[idIdx])
-            {
-                case 0x02: l = pct; lc = charging; break;
-                case 0x03: r = pct; rc = charging; break;
-                case 0x04: c = pct; cc = charging; break;
-            }
+            if (d[idIdx] == 0x06) return new Cell(pct, charging);
         }
-        return new Cell(l, r, c, lc, rc, cc);
+        return new Cell(null, false);
     }
 
     /// <summary>Firmware response: length at index 5, ASCII string starting at index 8.</summary>
